@@ -1,15 +1,31 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from sqlalchemy.orm import Session
 from typing import Optional
 import os
 import shutil
 
+import models
+from database import engine, SessionLocal
+
 app = FastAPI()
 
-# In-memory storage
-candidates = []
-candidate_id = 1
+# Create database tables
+models.Base.metadata.create_all(bind=engine)
 
 UPLOAD_FOLDER = "uploads"
+
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+
+# Dependency to get DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 
 # Health check
 @app.get("/health")
@@ -28,32 +44,34 @@ async def upload_resume(
     graduation_year: int = Form(...),
     experience: int = Form(...),
     skills: str = Form(...),
-    resume: UploadFile = File(...)
+    resume: UploadFile = File(...),
+    db: Session = Depends(get_db)
 ):
-    global candidate_id
 
     # Save file
     file_path = os.path.join(UPLOAD_FOLDER, resume.filename)
+
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(resume.file, buffer)
 
-    candidate = {
-        "id": candidate_id,
-        "name": name,
-        "dob": dob,
-        "phone": phone,
-        "address": address,
-        "education": education,
-        "graduation_year": graduation_year,
-        "experience": experience,
-        "skills": skills.split(","),
-        "resume_file": file_path
-    }
+    # Save to database
+    candidate = models.Candidate(
+        name=name,
+        dob=dob,
+        phone=phone,
+        address=address,
+        education=education,
+        graduation_year=graduation_year,
+        experience=experience,
+        skills=skills,
+        resume_file=file_path
+    )
 
-    candidates.append(candidate)
-    candidate_id += 1
+    db.add(candidate)
+    db.commit()
+    db.refresh(candidate)
 
-    return {"message": "Resume uploaded successfully", "id": candidate["id"]}
+    return {"message": "Resume uploaded successfully", "id": candidate.id}
 
 
 # List candidates with filters
@@ -61,34 +79,46 @@ async def upload_resume(
 def get_candidates(
     skill: Optional[str] = None,
     experience: Optional[int] = None,
-    graduation_year: Optional[int] = None
+    graduation_year: Optional[int] = None,
+    db: Session = Depends(get_db)
 ):
-    result = candidates
+
+    query = db.query(models.Candidate)
 
     if skill:
-        result = [c for c in result if skill.lower() in [s.lower() for s in c["skills"]]]
+        query = query.filter(models.Candidate.skills.contains(skill))
 
     if experience is not None:
-        result = [c for c in result if c["experience"] == experience]
+        query = query.filter(models.Candidate.experience == experience)
 
     if graduation_year is not None:
-        result = [c for c in result if c["graduation_year"] == graduation_year]
+        query = query.filter(models.Candidate.graduation_year == graduation_year)
 
-    return result
+    return query.all()
 
 
 # Get candidate by ID
 @app.get("/candidate/{id}")
-def get_candidate(id: int):
-    for c in candidates:
-        if c["id"] == id:
-            return c
-    raise HTTPException(status_code=404, detail="Candidate not found")
+def get_candidate(id: int, db: Session = Depends(get_db)):
+
+    candidate = db.query(models.Candidate).filter(models.Candidate.id == id).first()
+
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    return candidate
 
 
 # Delete candidate
 @app.delete("/candidate/{id}")
-def delete_candidate(id: int):
-    global candidates
-    candidates = [c for c in candidates if c["id"] != id]
+def delete_candidate(id: int, db: Session = Depends(get_db)):
+
+    candidate = db.query(models.Candidate).filter(models.Candidate.id == id).first()
+
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    db.delete(candidate)
+    db.commit()
+
     return {"message": "Candidate deleted"}
